@@ -285,6 +285,10 @@ async function startBot() {
   const { initialize: initChatHistory } = require('./utils/chatHistory');
   initChatHistory(sock);
 
+  // Restore scheduled status timers
+  const { restoreTimers: restoreSchedStatus } = require('./commands/owner/schedstatus');
+  restoreSchedStatus(sock);
+
   // Watchdog for inactive socket (Baileys bug fix)
   let lastActivity = Date.now();
   const INACTIVITY_TIMEOUT = 30 * 60 * 1000; // 30 minutes
@@ -489,14 +493,31 @@ async function startBot() {
   });
 
   // Anti-delete: catch message deletions and forward to owner
+  // Baileys v7 fires deletes via messages.update (status 13) AND messages.delete
   sock.ev.on('messages.update', (updates) => {
     for (const update of updates) {
-      // Baileys sends status 13 (DELETED) when a message is deleted for everyone
+      // Status 13 = DELETED (for everyone)
       if (update.update?.status === 13 && update.key?.id) {
+        console.log('[antiDelete] messages.update status=13 detected');
         const antideleteModule = require('./commands/owner/antidelete');
         if (antideleteModule.onMessageDelete) {
-          antideleteModule.onMessageDelete(sock, update, store).catch(() => {});
+          antideleteModule.onMessageDelete(sock, update, store).catch((e) => {
+            console.error('[antiDelete] error:', e.message);
+          });
         }
+      }
+    }
+  });
+
+  // Secondary delete listener — catches messages.delete events (Baileys v7 backup)
+  sock.ev.on('messages.delete', (deletions) => {
+    if (!deletions || !Array.isArray(deletions.keys)) return;
+    for (const key of deletions.keys) {
+      if (!key?.id) continue;
+      const antideleteModule = require('./commands/owner/antidelete');
+      if (antideleteModule.isEnabled && antideleteModule.isEnabled()) {
+        console.log('[antiDelete] messages.delete event detected');
+        antideleteModule.onMessageDelete(sock, { key }, store).catch(() => {});
       }
     }
   });
