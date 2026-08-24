@@ -24,7 +24,7 @@ const defaults = {
   view: true,       // view statuses by default
   react: true,      // react to statuses by default
   reaction: '\ud83d\udc9a',  // 💚
-  delay: 5          // seconds before reacting
+  delay: 50          // seconds before reacting
 };
 
 function loadConfig() {

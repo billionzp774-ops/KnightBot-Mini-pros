@@ -359,6 +359,14 @@ async function startBot() {
       // Initialize anti-call feature
       handler.initializeAntiCall(sock);
 
+      // Auto-init all commands that have init() (plugins like save, recovered)
+      const { getInitCommands } = require('./utils/commandLoader');
+      const initCmds = getInitCommands();
+      for (const cmd of initCmds) {
+        try { cmd.init(sock); } catch (e) { console.error(`[init] ${cmd.name}:`, e.message); }
+      }
+      if (initCmds.length) console.log(`🔌 ${initCmds.length} plugin(s) auto-initialized`);
+
       // Cleanup old chats (keep only active ones, e.g., last touched <1 day)
       const now = Date.now();
       for (const [jid, chatMsgs] of store.messages.entries()) {
