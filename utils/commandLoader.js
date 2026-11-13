@@ -6,9 +6,14 @@ const fs = require('fs');
 const path = require('path');
 
 let commandsMap = null;
+let initCommandsList = [];
+
+function getInitCommands() {
+        return initCommandsList;
+}
 
 function getCommandMap() {
-	return commandsMap;
+        return commandsMap;
 }
 
 function registerRegistryCommands(commands, modulePath, label) {
@@ -42,6 +47,7 @@ const loadCommands = () => {
   }
   
   const categories = fs.readdirSync(commandsPath);
+  const initCommands = []; // commands with init() to call after sock is ready
   
   categories.forEach(category => {
     const categoryPath = path.join(commandsPath, category);
@@ -57,6 +63,9 @@ const loadCommands = () => {
               command.aliases.forEach(alias => {
                 commandsMap.set(alias, command);
               });
+            }
+            if (typeof command.init === 'function') {
+              initCommands.push(command);
             }
           }
         } catch (error) {
@@ -77,7 +86,10 @@ const loadCommands = () => {
     console.error('Plugin restore failed:', err.message);
   });
 
+  // Store init commands for later (called from index.js after sock connects)
+  initCommandsList = initCommands;
+
   return commandsMap;
 };
 
-module.exports = { loadCommands, getCommandMap, registerFunCommands, registerEconomyCommands };
+module.exports = { loadCommands, getCommandMap, getInitCommands, registerFunCommands, registerEconomyCommands };

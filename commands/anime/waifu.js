@@ -6,9 +6,11 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const { getTempDir, deleteTempFile } = require('../../utils/tempManager');
+const { fitWhatsAppImage } = require('../../utils/fitImage');
+const config = require('../../config');
 
-const BASE = 'https://api.princetechn.com/api/anime/waifu';
-const API_KEY = 'prince';
+const BASE = `${config.knightApiUrl}/api/anime/waifu`;
+const API_KEY = config.knightApiKey;
 
 module.exports = {
   name: 'waifu',
@@ -28,12 +30,9 @@ module.exports = {
         timeout: 30000
       });
       
-      // Extract image URL from response
-      if (!response.data || !response.data.result) {
-        throw new Error('Invalid API response: missing image URL');
-      }
-      
-      const imageUrl = response.data.result;
+      // Knight returns { result: { url, image } }; older APIs returned a string URL
+      const result = response.data?.result;
+      const imageUrl = typeof result === 'string' ? result : (result?.url || result?.image);
       
       if (!imageUrl || typeof imageUrl !== 'string') {
         throw new Error('Invalid image URL in API response');
@@ -43,24 +42,20 @@ module.exports = {
       const imageResponse = await axios.get(imageUrl, {
         responseType: 'arraybuffer',
         headers: {
-          'User-Agent': 'Mozilla/5.0',
+          'User-Agent': 'KnightBot/1.0',
           'Accept': 'image/*'
         },
         timeout: 30000
       });
       
-      const imageBuffer = Buffer.from(imageResponse.data);
+      let imageBuffer = Buffer.from(imageResponse.data);
       
       // Verify buffer is valid
       if (!imageBuffer || imageBuffer.length === 0) {
         throw new Error('Empty image response');
       }
-      
-      // Check file size (WhatsApp image limit is 5MB)
-      const maxImageSize = 5 * 1024 * 1024; // 5MB
-      if (imageBuffer.length > maxImageSize) {
-        throw new Error(`Image too large: ${(imageBuffer.length / 1024 / 1024).toFixed(2)}MB (max 5MB)`);
-      }
+
+      imageBuffer = await fitWhatsAppImage(imageBuffer);
       
       // Determine file extension from URL or content type
       const contentType = imageResponse.headers['content-type'] || '';
@@ -107,17 +102,20 @@ module.exports = {
       }
       
     } catch (error) {
-      console.error('Error in waifu command:', error);
-      
-      // Handle specific error cases
-      if (error.response?.status === 404) {
-        await extra.reply('❌ Image not found. Please try again.');
-      } else if (error.response?.status === 429) {
-        await extra.reply('❌ Rate limit exceeded. Please try again later.');
-      } else if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
-        await extra.reply('❌ Request timed out. Please try again.');
+      const status = error.response?.status;
+      const reason = error.response?.data?.result?.error
+        || error.response?.data?.message
+        || error.message;
+      console.error(`[waifu] ${status || error.code || 'error'}: ${reason}`);
+
+      if (status === 404) {
+        await extra.reply('❌ Image not found. Try again.');
+      } else if (status === 429) {
+        await extra.reply('❌ Knight API limit reached. Try again in a minute.');
+      } else if (error.code === 'ECONNABORTED' || String(error.message).includes('timeout')) {
+        await extra.reply('❌ Request timed out. Try again.');
       } else {
-        await extra.reply(`❌ Failed to fetch waifu image: ${error.message}`);
+        await extra.reply(`❌ Could not fetch waifu image. ${reason}`);
       }
     }
   }

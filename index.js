@@ -63,11 +63,19 @@ const {
 const qrcode = require('qrcode-terminal');
 const config = require('./config');
 const handler = require('./handler');
+const botState = require('./sharedState');
+const antidelete = require('./utils/antidelete');
+const savestatus = require('./utils/savestatus');
+const autostatus = require('./utils/autostatus');
+const { rememberFromMessage, rememberContact } = require('./utils/nameCache');
+const groupStatusTracker = require('./utils/groupStatusTracker');
+const { createStatusRevoker } = require('./utils/statusRevoke');
 const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
 const os = require('os');
-const botState = require('./sharedState');
+const lidMappingStore = require('./utils/lidMappingStore');
+lidMappingStore.hydrate(); // restore saved LID->phone pairs for the dashboard
 
 // Remove Puppeteer cache (if some dependency downloaded Chromium into ~/.cache/puppeteer)
 function cleanupPuppeteerCache() {
@@ -87,39 +95,43 @@ function cleanupPuppeteerCache() {
 // Optimized in-memory store with hard limits (Map-based for better memory management)
 const store = {
   messages: new Map(), // Use Map instead of plain object
-  maxPerChat: 50, // Limit to 50 messages per chat (used by ,cc and other features)
+  byId: new Map(),
+  maxPerChat: 20, // Limit to 20 messages per chat
+  maxById: 300,
 
   bind: (ev) => {
     ev.on('messages.upsert', ({ messages }) => {
       for (const msg of messages) {
         if (!msg.key?.id) continue;
+        rememberFromMessage(msg);
+        groupStatusTracker.recordFromMessage(msg);
 
         // --- LID -> PN mapping capture for dashboard ---
-        const remoteJid = msg.key.remoteJid;
+        const remoteJid0 = msg.key.remoteJid;
         const remoteJidAlt = msg.key.remoteJidAlt;
-        const participant = msg.key.participant;
+        const participant0 = msg.key.participant;
         const participantAlt = msg.key.participantAlt;
 
-        if (remoteJid && remoteJidAlt) {
-          const isRLid = remoteJid.endsWith('@lid');
+        if (remoteJid0 && remoteJidAlt) {
+          const isRLid = remoteJid0.endsWith('@lid');
           if (isRLid && !remoteJidAlt.endsWith('@lid')) {
-            botState.setLidMapping(remoteJid, remoteJidAlt);
+            botState.setLidMapping(remoteJid0, remoteJidAlt);
           } else if (!isRLid && remoteJidAlt.endsWith('@lid')) {
-            botState.setLidMapping(remoteJidAlt, remoteJid);
+            botState.setLidMapping(remoteJidAlt, remoteJid0);
           }
         }
 
-        if (participant && participantAlt) {
-          const isPLid = participant.endsWith('@lid');
+        if (participant0 && participantAlt) {
+          const isPLid = participant0.endsWith('@lid');
           if (isPLid && !participantAlt.endsWith('@lid')) {
-            botState.setLidMapping(participant, participantAlt);
+            botState.setLidMapping(participant0, participantAlt);
           } else if (!isPLid && participantAlt.endsWith('@lid')) {
-            botState.setLidMapping(participantAlt, participant);
+            botState.setLidMapping(participantAlt, participant0);
           }
         }
 
         if (msg.pushName) {
-          const sJid = participant || remoteJid;
+          const sJid = participant0 || remoteJid0;
           if (sJid) botState.setContactName(sJid, msg.pushName);
         }
         // --- End LID mapping capture ---
@@ -131,6 +143,7 @@ const store = {
 
         const chatMsgs = store.messages.get(jid);
         chatMsgs.set(msg.key.id, msg);
+        store.byId.set(msg.key.id, msg);
 
         // Aggressive cleanup per chat - keep only recent messages
         if (chatMsgs.size > store.maxPerChat) {
@@ -138,12 +151,34 @@ const store = {
           const oldestKey = chatMsgs.keys().next().value;
           chatMsgs.delete(oldestKey);
         }
+        if (store.byId.size > store.maxById) {
+          const oldestId = store.byId.keys().next().value;
+          store.byId.delete(oldestId);
+        }
+      }
+    });
+    ev.on('contacts.upsert', (contacts) => {
+      for (const contact of contacts || []) rememberContact(contact);
+    });
+    ev.on('contacts.update', (contacts) => {
+      for (const contact of contacts || []) rememberContact(contact);
+    });
+    ev.on('messaging-history.set', ({ contacts, messages }) => {
+      for (const contact of contacts || []) rememberContact(contact);
+      for (const msg of messages || []) {
+        rememberFromMessage(msg);
+        groupStatusTracker.recordFromMessage(msg);
+      }
+    });
+    ev.on('contacts.upsert', (contacts) => {
+      for (const contact of contacts || []) {
+        if (contact?.id && contact?.name) botState.setContactName(contact.id, contact.name);
       }
     });
   },
 
   loadMessage: async (jid, id) => {
-    return store.messages.get(jid)?.get(id) || null;
+    return store.messages.get(jid)?.get(id) || store.byId.get(id) || null;
   }
 };
 
@@ -267,23 +302,33 @@ async function startBot() {
     syncFullHistory: false,
     downloadHistory: false,
     markOnlineOnConnect: false,
-    getMessage: async () => undefined // Don't load messages from store
+    getMessage: async () => undefined, // Don't load messages from store
+    cachedGroupMetadata: async (jid) => handler.peekGroupMetadata(jid),
+    useCachedGroupMetadata: true,
   });
+
+  sock.rawGroupMetadata = sock.groupMetadata.bind(sock);
+  sock.revokeGroupStatus = createStatusRevoker(sock);
 
   // Bind store to socket
   store.bind(sock.ev);
+  sock.store = store;
 
   // Share sock + store with web dashboard
   botState.setSock(sock);
   botState.setStore(store);
 
-  // Initialize status reactor (separate listener, does not touch main handler)
+  // Initialize status reactor (50s delay view+react — our custom)
   const { initializeStatusReactor } = require('./utils/statusReactor');
   initializeStatusReactor(sock);
 
   // Initialize chat history (for AI features like ,cc)
   const { initialize: initChatHistory } = require('./utils/chatHistory');
   initChatHistory(sock);
+
+  // Restore scheduled status timers (,schedstatus)
+  const { restoreTimers: restoreSchedStatus } = require('./commands/owner/schedstatus');
+  restoreSchedStatus(sock);
 
   // Watchdog for inactive socket (Baileys bug fix)
   let lastActivity = Date.now();
@@ -309,6 +354,7 @@ async function startBot() {
     const { connection } = update;
     if (connection === 'open') {
       lastActivity = Date.now(); // Reset on open
+      sock.groupAlertsReadyAt = Date.now() + 15000;
     } else if (connection === 'close') {
       clearInterval(watchdogInterval);
     }
@@ -328,8 +374,8 @@ async function startBot() {
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const errorMessage = lastDisconnect?.error?.message || 'Unknown error';
 
-      // Suppress verbose error output for common stream errors (515, etc.)
-      if (statusCode === 515 || statusCode === 503 || statusCode === 408) {
+      // Suppress verbose error output for common stream / gateway errors
+      if (statusCode === 515 || statusCode === 503 || statusCode === 502 || statusCode === 504 || statusCode === 408) {
         console.log(`⚠️ Connection closed (${statusCode}). Reconnecting...`);
       } else {
         console.log('Connection closed due to:', errorMessage, '\nReconnecting:', shouldReconnect);
@@ -346,6 +392,7 @@ async function startBot() {
       const ownerNames = Array.isArray(config.ownerName) ? config.ownerName.join(',') : config.ownerName;
       console.log(`👑 Owner: ${ownerNames}\n`);
       console.log('Bot is ready to receive messages!\n');
+      sock.groupAlertsReadyAt = Date.now() + 15000;
 
       // Set bot status
       if (config.autoBio) {
@@ -354,6 +401,17 @@ async function startBot() {
 
       // Initialize anti-call feature
       handler.initializeAntiCall(sock);
+
+      // Learn LID <-> real phone pairs from WhatsApp (dashboard + welcome mentions)
+      lidMappingStore.attach(sock);
+
+      // Auto-init all commands that have init() (plugins like save, recovered)
+      const { getInitCommands } = require('./utils/commandLoader');
+      const initCmds = getInitCommands();
+      for (const cmd of initCmds) {
+        try { cmd.init(sock); } catch (e) { console.error(`[init] ${cmd.name}:`, e.message); }
+      }
+      if (initCmds.length) console.log(`🔌 ${initCmds.length} plugin(s) auto-initialized`);
 
       // Cleanup old chats (keep only active ones, e.g., last touched <1 day)
       const now = Date.now();
@@ -381,9 +439,6 @@ async function startBot() {
 
   // Messages handler - Process only new messages
   sock.ev.on('messages.upsert', ({ messages, type }) => {
-    // Only process "notify" type (new messages), skip "append" (old messages from history)
-    if (type !== 'notify') return;
-
     // Process messages in the array
     for (const msg of messages) {
       // Skip if message is invalid or missing key
@@ -394,7 +449,23 @@ async function startBot() {
         continue;
       }
 
-      // System message filter - ignore broadcast/status/newsletter messages
+      // Status can arrive as "append". Save it before the notify-only filter.
+      if (from === 'status@broadcast' || from.includes('status@broadcast')) {
+        if (!processedMessages.has(msg.key.id)) {
+          processedMessages.add(msg.key.id);
+          savestatus.autoSave(sock, msg).catch(err => {
+            console.error('[savestatus]', err.message);
+          });
+          // Note: autostatus.reactToStatus not wired here —
+          // our statusReactor (50s delay) handles view+react instead.
+        }
+        continue;
+      }
+
+      // Only process "notify" type (new messages), skip "append" (old messages from history)
+      if (type !== 'notify') continue;
+
+      // System message filter - ignore broadcast/newsletter messages
       if (isSystemJid(from)) {
         continue; // Silently ignore system messages
       }
@@ -438,8 +509,9 @@ async function startBot() {
         }
       }
 
-      // Notify dashboard of new message
-      botState.emit('newMessage', { jid: from, msgId: msg.key.id, fromMe: !!msg.key.fromMe, timestamp: msg.messageTimestamp });
+      antidelete.onMessage(sock, msg).catch(err => {
+        console.error('[antidelete]', err.message);
+      });
 
       // Process command IMMEDIATELY (don't block on other operations)
       handler.handleMessage(sock, msg).catch(err => {
@@ -459,7 +531,7 @@ async function startBot() {
           }
         } catch (_) {}
 
-        // Ghost mode check
+        // Ghost mode check — if ON, skip read receipts
         const { isGhostMode } = require('./commands/owner/ghost');
         if (isGhostMode()) return;
         if (config.autoRead && from.endsWith('@g.us')) {
@@ -488,32 +560,22 @@ async function startBot() {
     // Silently handle receipt updates
   });
 
-  // Anti-delete: catch message deletions and forward to owner
   sock.ev.on('messages.update', (updates) => {
-    for (const update of updates) {
-      // Baileys sends status 13 (DELETED) when a message is deleted for everyone
-      if (update.update?.status === 13 && update.key?.id) {
-        const antideleteModule = require('./commands/owner/antidelete');
-        if (antideleteModule.onMessageDelete) {
-          antideleteModule.onMessageDelete(sock, update, store).catch(() => {});
-        }
-      }
-    }
+    antidelete.onUpdates(sock, updates).catch(err => {
+      console.error('[antidelete]', err.message);
+    });
   });
 
   // Group participant updates (join/leave)
   sock.ev.on('group-participants.update', async (update) => {
+    if (!sock.ws?.isOpen) return;
+    if (sock.groupAlertsReadyAt && Date.now() < sock.groupAlertsReadyAt) return;
     await handler.handleGroupUpdate(sock, update);
   });
 
-  // Handle errors - suppress common stream errors
+  // Handle errors - suppress common stream / gateway blips
   sock.ev.on('error', (error) => {
-    const statusCode = error?.output?.statusCode;
-    // Suppress verbose output for common stream errors
-    if (statusCode === 515 || statusCode === 503 || statusCode === 408) {
-      // These are usually temporary connection issues, handled by reconnection
-      return;
-    }
+    if (isTransientNetworkError(error)) return;
     console.error('Socket error:', error.message || error);
   });
 
@@ -533,6 +595,29 @@ startBot().catch(err => {
   console.error('Error starting bot:', err);
   process.exit(1);
 });
+/** Transient WA / network blips — reconnect handles these; don't dump stacks. */
+function isTransientNetworkError(err) {
+  if (!err) return false;
+  const msg = String(err.message || err);
+  const code = err.code || err.response?.statusCode || err.output?.statusCode;
+  if (
+    code === 408 || code === 502 || code === 503 || code === 504 ||
+    code === 515 || code === 'ETIMEDOUT' || code === 'ECONNRESET' ||
+    code === 'ECONNREFUSED' || code === 'ENOTFOUND' || code === 'EAI_AGAIN' ||
+    code === 'ERR_NON_2XX_3XX_RESPONSE'
+  ) {
+    return true;
+  }
+  return /Gateway Time-out|gateway timeout|timed?\s*out|socket hang up|ECONNRESET|ETIMEDOUT|ENOTFOUND|fetch failed|Connection Closed|Stream Errored/i.test(msg);
+}
+
+function briefErr(err) {
+  if (!err) return 'unknown';
+  const code = err.code || err.response?.statusCode || err.output?.statusCode || '';
+  const msg = err.message || String(err);
+  return code ? `${code}: ${msg}` : msg;
+}
+
 // Handle process termination
 process.on('uncaughtException', (err) => {
   // Handle ENOSPC errors gracefully without crashing
@@ -543,11 +628,15 @@ process.on('uncaughtException', (err) => {
     console.warn('⚠️ Cleanup completed. Bot will continue but may experience issues until space is freed.');
     return; // Don't crash, just log and continue
   }
+  if (isTransientNetworkError(err)) {
+    console.warn(`⚠️ Transient error (ignored): ${briefErr(err)}`);
+    return;
+  }
   console.error('Uncaught Exception:', err);
 });
 process.on('unhandledRejection', (err) => {
   // Handle ENOSPC errors gracefully
-  if (err.code === 'ENOSPC' || err.errno === -28 || err.message?.includes('no space left on device')) {
+  if (err?.code === 'ENOSPC' || err?.errno === -28 || err?.message?.includes('no space left on device')) {
     console.warn('⚠️ ENOSPC Error in promise: No space left on device. Attempting cleanup...');
     const { cleanupOldFiles } = require('./utils/cleanup');
     cleanupOldFiles();
@@ -556,11 +645,18 @@ process.on('unhandledRejection', (err) => {
   }
 
   // Don't spam console with rate limit errors
-  if (err.message && err.message.includes('rate-overlimit')) {
+  if (err?.message && err.message.includes('rate-overlimit')) {
     console.warn('⚠️ Rate limit reached. Please slow down your requests.');
     return;
   }
-  console.error('Unhandled Rejection:', err);
+
+  // WhatsApp / got 408·502·503·504 during connect — reconnect already covers this
+  if (isTransientNetworkError(err)) {
+    console.warn(`⚠️ Network blip (ignored, reconnecting if needed): ${briefErr(err)}`);
+    return;
+  }
+
+  console.error('Unhandled Rejection:', briefErr(err));
 });
 // Start web dashboard alongside bot
 require('./server');

@@ -3,7 +3,7 @@
  */
 
 const BAD_WORDS = [
-  'gandu', 'madarchod', 'bhosdike', 'bsdk', 'fucker', 'bhosda',
+  'gandu', 'madarchod', 'bhosdike', 'bsdk', 'fucker', 'bhosda', 'lodu', 'lode', 'bkl',
   'lauda', 'laude', 'betichod', 'chutiya', 'maa ki chut', 'behenchod',
   'behen ki chut', 'tatto ke saudagar', 'machar ki jhant', 'jhant ka baal',
   'randi', 'chuchi', 'boobs', 'boobies', 'tits', 'idiot', 'nigga', 'fuck',

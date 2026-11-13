@@ -491,6 +491,110 @@ const APIs = {
     }
   },
   
+  knightBase() {
+    const config = require('../config');
+    return (config.knightApiUrl || 'https://knightbotapi.stream').replace(/\/$/, '');
+  },
+
+  knightKey() {
+    const config = require('../config');
+    return config.knightApiKey || config.mediaApiKey || 'knight';
+  },
+
+  // KnightBot card PNG — GET /api/card/:kind (welcome, goodbye, wanted, jail, …)
+  getCardImage: async (kind, params = {}) => {
+    const card = String(kind || '').trim().toLowerCase();
+    if (!card) throw new Error('Card type required');
+    const response = await api.get(`${APIs.knightBase()}/api/card/${encodeURIComponent(card)}`, {
+      params: { apikey: APIs.knightKey(), ...params },
+      timeout: 45000,
+      responseType: 'arraybuffer',
+      headers: { Accept: 'image/png' },
+      validateStatus: () => true,
+    });
+    const ctype = String(response.headers['content-type'] || '');
+    if (ctype.includes('json')) {
+      let data = {};
+      try { data = JSON.parse(Buffer.from(response.data).toString()); } catch {}
+      throw new Error(data.error || data.message || `Card ${card} failed`);
+    }
+    if (response.status >= 400 || !response.data || response.data.byteLength < 80) {
+      throw new Error(`Card ${card} failed (${response.status})`);
+    }
+    return Buffer.from(response.data);
+  },
+
+  // Upload an image buffer to uguu.se and get a short-lived public URL
+  uploadTempImage: async (buffer, filename = 'image.jpg', contentType = 'image/jpeg') => {
+    const FormData = require('form-data');
+    const form = new FormData();
+    form.append('files[]', buffer, { filename, contentType });
+    const { data } = await axios.post('https://uguu.se/upload', form, {
+      headers: form.getHeaders(),
+      timeout: 30000,
+      maxBodyLength: 20 * 1024 * 1024,
+    });
+    const url = data?.files?.[0]?.url || data?.data?.files?.[0]?.url || data?.[0]?.url;
+    if (!url) throw new Error('Image upload failed');
+    return url;
+  },
+
+  // KnightBot meme maker — GET /api/img/meme (url, top, optional bottom)
+  getMemeImage: async ({ url, top, bottom }) => {
+    const params = { apikey: APIs.knightKey(), url, top };
+    if (bottom) params.bottom = bottom;
+    const response = await api.get(`${APIs.knightBase()}/api/img/meme`, {
+      params,
+      timeout: 45000,
+      responseType: 'arraybuffer',
+      validateStatus: () => true,
+    });
+    const body = Buffer.from(response.data || []);
+    // Browser-like clients get the PNG directly; others get JSON with a download link.
+    if (!String(response.headers['content-type'] || '').includes('json')) {
+      if (response.status >= 400 || body.length < 80) throw new Error(`Meme failed (${response.status})`);
+      return body;
+    }
+    let data = {};
+    try { data = JSON.parse(body.toString()); } catch {}
+    const download = data?.result?.download;
+    if (!data?.success || !download) {
+      throw new Error(data?.error || data?.message || data?.result?.error || 'Meme failed');
+    }
+    // The download link expires in ~5 minutes, so fetch it right away.
+    const file = await api.get(download, { responseType: 'arraybuffer', timeout: 30000 });
+    return Buffer.from(file.data);
+  },
+
+  // KnightBot Reactions GIF — GET /api/gif/:type
+  getReactionGif: async (type) => {
+    const config = require('../config');
+    const kind = String(type || '').trim().toLowerCase();
+    if (!kind) throw new Error('GIF type required');
+    const base = (config.knightApiUrl || 'https://knightbotapi.stream').replace(/\/$/, '');
+    const key = config.knightApiKey || config.mediaApiKey || 'knight';
+    const response = await api.get(`${base}/api/gif/${encodeURIComponent(kind)}`, {
+      params: { apikey: key },
+      timeout: 20000,
+      headers: { Accept: 'application/json' },
+    });
+    const data = response.data || {};
+    const result = data.result || data;
+    const url = result.url || result.image || data.url;
+    if (!data.success && !url) {
+      throw new Error(data.error || result.error || `No ${kind} gif`);
+    }
+    if (!url) throw new Error(`No ${kind} gif url`);
+    return {
+      type: result.type || kind,
+      url,
+      image: result.image || url,
+      title: result.title || kind,
+      anime: result.anime || null,
+      pairing: result.pairing || null,
+    };
+  },
+
   // Text to Speech API
   textToSpeech: async (text) => {
     try {

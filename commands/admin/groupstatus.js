@@ -3,18 +3,98 @@ const {
   generateWAMessageContent,
   generateWAMessageFromContent,
   downloadContentFromMessage,
+  downloadMediaMessage,
 } = require('@whiskeysockets/baileys');
 const { PassThrough } = require('stream');
 const ffmpeg = require('fluent-ffmpeg');
+const config = require('../../config');
+const groupStatusTracker = require('../../utils/groupStatusTracker');
 
 // Single default color for text statuses (purple)
 const PURPLE_COLOR = '#9C27B0';
 
+function px() {
+  return config.prefix;
+}
+
+/** Unwrap ephemeral / view-once wrappers to the inner message object. */
+function unwrapMessage(message) {
+  if (!message || typeof message !== 'object') return message;
+  if (message.ephemeralMessage?.message) return unwrapMessage(message.ephemeralMessage.message);
+  if (message.viewOnceMessage?.message) return unwrapMessage(message.viewOnceMessage.message);
+  if (message.viewOnceMessageV2?.message) return unwrapMessage(message.viewOnceMessageV2.message);
+  if (message.viewOnceMessageV2Extension?.message) {
+    return unwrapMessage(message.viewOnceMessageV2Extension.message);
+  }
+  return message;
+}
+
+/**
+ * Resolve media from the command message itself OR a replied message.
+ * Returns { kind, targetMessage, mediaMsg } or null.
+ */
+function resolveMedia(msg) {
+  const own = unwrapMessage(msg.message);
+  if (own?.imageMessage) {
+    return { kind: 'image', targetMessage: msg, mediaMsg: own.imageMessage };
+  }
+  if (own?.videoMessage) {
+    return { kind: 'video', targetMessage: msg, mediaMsg: own.videoMessage };
+  }
+  if (own?.audioMessage) {
+    return { kind: 'audio', targetMessage: msg, mediaMsg: own.audioMessage };
+  }
+  if (own?.stickerMessage) {
+    return { kind: 'sticker', targetMessage: msg, mediaMsg: own.stickerMessage };
+  }
+  if (own?.documentMessage && /^image\//i.test(own.documentMessage.mimetype || '')) {
+    return { kind: 'image', targetMessage: msg, mediaMsg: own.documentMessage };
+  }
+
+  const ctx =
+    own?.extendedTextMessage?.contextInfo ||
+    own?.imageMessage?.contextInfo ||
+    own?.videoMessage?.contextInfo ||
+    msg.message?.extendedTextMessage?.contextInfo;
+
+  const quoted = unwrapMessage(ctx?.quotedMessage);
+  if (!quoted || !ctx?.stanzaId) return null;
+
+  const targetMessage = {
+    key: {
+      remoteJid: msg.key.remoteJid,
+      id: ctx.stanzaId,
+      participant: ctx.participant,
+    },
+    message: quoted,
+  };
+
+  if (quoted.imageMessage) {
+    return { kind: 'image', targetMessage, mediaMsg: quoted.imageMessage };
+  }
+  if (quoted.videoMessage) {
+    return { kind: 'video', targetMessage, mediaMsg: quoted.videoMessage };
+  }
+  if (quoted.audioMessage) {
+    return { kind: 'audio', targetMessage, mediaMsg: quoted.audioMessage };
+  }
+  if (quoted.stickerMessage) {
+    return { kind: 'sticker', targetMessage, mediaMsg: quoted.stickerMessage };
+  }
+  if (quoted.documentMessage && /^image\//i.test(quoted.documentMessage.mimetype || '')) {
+    return { kind: 'image', targetMessage, mediaMsg: quoted.documentMessage };
+  }
+
+  return null;
+}
+
 module.exports = {
   name: 'groupstatus',
   aliases: ['togstatus', 'swgc', 'gs', 'gstatus'],
-  description: 'Post replied media or text as a WhatsApp group status (new Group Status feature).',
-  usage: '.groupstatus [caption]  (reply to image/video/audio) OR .groupstatus your text',
+  description: 'Post replied or attached media/text as a WhatsApp group status.',
+  get usage() {
+    return `${px()}groupstatus [caption]  (send/reply image/video/audio) OR ${px()}groupstatus your text`;
+  },
   category: 'admin',
   groupOnly: true,
   adminOnly: true,
@@ -23,27 +103,27 @@ module.exports = {
   async execute(sock, msg, args, extra) {
     try {
       const from = extra.from;
+      const p = px();
 
-      // Only inside groups
       if (!extra.isGroup) {
         return extra.reply('👥 This command can only be used in groups.');
       }
 
       const caption = (args.join(' ') || '').trim();
+      const media = resolveMedia(msg);
 
-      const ctxInfo = msg.message?.extendedTextMessage?.contextInfo;
-      const hasQuoted = !!ctxInfo?.quotedMessage;
-
-      // CASE 1: No quoted message -> treat as TEXT group status
-      if (!hasQuoted) {
+      // TEXT-only status when no media on this message and no media reply
+      if (!media) {
         if (!caption) {
           return extra.reply(
             '📝 *Group Status Usage*\n\n' +
-            '• Reply to image/video/audio with:\n' +
-            '  `.groupstatus [optional caption]`\n' +
-            '• Or send text status only:\n' +
-            '  `.groupstatus Your text here`\n\n' +
-            'Text statuses use a single purple background color by default.'
+            '• Send an *image/video/audio* with caption:\n' +
+            `  \`${p}groupstatus [optional caption]\`\n` +
+            '• Or reply to image/video/audio/sticker with:\n' +
+            `  \`${p}groupstatus [optional caption]\`\n` +
+            '• Or text status only:\n' +
+            `  \`${p}groupstatus Your text here\`\n\n` +
+            'Text statuses use a purple background by default.'
           );
         }
 
@@ -61,38 +141,35 @@ module.exports = {
         }
       }
 
-      // CASE 2: Quoted media -> image/video/audio group status
-      const targetMessage = {
-        key: {
-          remoteJid: from,
-          id: ctxInfo.stanzaId,
-          participant: ctxInfo.participant,
-        },
-        message: ctxInfo.quotedMessage,
-      };
-
-      const mtype = Object.keys(targetMessage.message)[0] || '';
-
-      const downloadBuf = async () => {
-        const qmsg = targetMessage.message;
-        if (/image/i.test(mtype))   return await downloadMedia(qmsg, 'image');
-        if (/video/i.test(mtype))   return await downloadMedia(qmsg, 'video');
-        if (/audio/i.test(mtype))   return await downloadMedia(qmsg, 'audio');
-        if (/sticker/i.test(mtype)) return await downloadMedia(qmsg, 'sticker'); // download sticker correctly
-        return null;
-      };
-
-      // IMAGE (also handles stickers)
-      if (/image|sticker/i.test(mtype)) {
-        await extra.reply('⏳ Posting image group status...');
-        let buf;
+      let buf;
+      try {
+        buf = await downloadMediaMessage(
+          media.targetMessage,
+          'buffer',
+          {},
+          { logger: undefined, reuploadRequest: sock.updateMediaMessage }
+        );
+      } catch (dlErr) {
+        // Fallback for older quoted shapes
         try {
-          buf = await downloadBuf();
-        } catch {
-          return extra.reply('❌ Failed to download image');
+          const type =
+            media.kind === 'sticker' ? 'sticker' :
+            media.kind === 'video' ? 'video' :
+            media.kind === 'audio' ? 'audio' : 'image';
+          buf = await downloadMedia(media.targetMessage.message, type);
+        } catch (e2) {
+          console.error('groupstatus download error:', dlErr, e2);
+          return extra.reply('❌ Failed to download media');
         }
-        if (!buf) return extra.reply('❌ Could not download image');
+      }
 
+      if (!buf || !buf.length) {
+        return extra.reply('❌ Could not download media');
+      }
+
+      // IMAGE / STICKER / image documents
+      if (media.kind === 'image' || media.kind === 'sticker') {
+        await extra.reply('⏳ Posting image group status...');
         try {
           await groupStatus(sock, from, {
             image: buf,
@@ -106,16 +183,8 @@ module.exports = {
       }
 
       // VIDEO
-      if (/video/i.test(mtype)) {
+      if (media.kind === 'video') {
         await extra.reply('⏳ Posting video group status...');
-        let buf;
-        try {
-          buf = await downloadBuf();
-        } catch {
-          return extra.reply('❌ Failed to download video');
-        }
-        if (!buf) return extra.reply('❌ Could not download video');
-
         try {
           await groupStatus(sock, from, {
             video: buf,
@@ -128,16 +197,9 @@ module.exports = {
         }
       }
 
-      // AUDIO (voice-style group status)
-      if (/audio/i.test(mtype)) {
+      // AUDIO
+      if (media.kind === 'audio') {
         await extra.reply('⏳ Posting audio group status...');
-        let buf;
-        try {
-          buf = await downloadBuf();
-        } catch {
-          return extra.reply('❌ Failed to download audio');
-        }
-        if (!buf) return extra.reply('❌ Could not download audio');
 
         let vn;
         try {
@@ -167,7 +229,7 @@ module.exports = {
         }
       }
 
-      return extra.reply('❌ Unsupported media type. Reply to an image, video, or audio.');
+      return extra.reply('❌ Unsupported media type. Send or reply to an image, video, or audio.');
     } catch (e) {
       console.error('groupstatus command error (outer):', e);
       return extra.reply('❌ Error: ' + (e.message || e));
@@ -178,8 +240,8 @@ module.exports = {
 // ---- Helpers ----
 
 async function downloadMedia(msg, type) {
-  const mediaMsg = msg[`${type}Message`] || msg;
-  const stream = await downloadContentFromMessage(mediaMsg, type);
+  const mediaMsg = msg[`${type}Message`] || msg.documentMessage || msg;
+  const stream = await downloadContentFromMessage(mediaMsg, type === 'sticker' ? 'sticker' : type);
   const chunks = [];
   for await (const chunk of stream) {
     chunks.push(chunk);
@@ -213,6 +275,7 @@ async function groupStatus(sock, jid, content) {
   );
 
   await sock.relayMessage(jid, msg.message, { messageId: msg.key.id });
+  groupStatusTracker.record({ remoteJid: jid, id: msg.key.id, fromMe: true });
   return msg;
 }
 

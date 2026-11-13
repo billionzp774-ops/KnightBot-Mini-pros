@@ -3,6 +3,7 @@
  */
 
 const config = require('../../config');
+const database = require('../../database');
 const { loadCommands } = require('../../utils/commandLoader');
 
 module.exports = {
@@ -102,13 +103,58 @@ module.exports = {
         menuText += `\n`;
       }
       
-      // Fun Commands
+      // Fun Commands (exclude economy/betting games — those go under GAMES)
+      const FUN_HIDE = new Set([
+        'bomb', 'horse', 'slots', 'coinflip', 'rps', 'tictactoe',
+      ]);
       if (categories.fun) {
+        const funCmds = categories.fun.filter((cmd) => !FUN_HIDE.has(cmd.name));
+        if (funCmds.length) {
+          menuText += `┏━━━━━━━━━━━━━━━━━\n`;
+          menuText += `┃ 🎭 FUN COMMAND\n`;
+          menuText += `┗━━━━━━━━━━━━━━━━━\n`;
+          funCmds.forEach(cmd => {
+            menuText += `│ ➜ ${config.prefix}${cmd.name}\n`;
+          });
+          menuText += `\n`;
+        }
+      }
+
+      // Games — horse, slots, coinflip, rps, tictactoe, etc.
+      const GAME_MENU_NAMES = [
+        'bomb',
+        'bet',
+        'horse',
+        'slots',
+        'coinflip',
+        'rps',
+        'tictactoe',
+        'fish',
+        'hunt',
+        'chop',
+        'forage',
+        'rpg',
+      ];
+      const gameLines = [];
+      const gameSeen = new Set();
+      for (const name of GAME_MENU_NAMES) {
+        if (!commands.has(name) || gameSeen.has(name)) continue;
+        gameSeen.add(name);
+        gameLines.push(name);
+      }
+      if (categories.games) {
+        for (const cmd of categories.games) {
+          if (gameSeen.has(cmd.name)) continue;
+          gameSeen.add(cmd.name);
+          gameLines.push(cmd.name);
+        }
+      }
+      if (gameLines.length) {
         menuText += `┏━━━━━━━━━━━━━━━━━\n`;
-        menuText += `┃ 🎭 FUN COMMAND\n`;
+        menuText += `┃ 🎮 GAMES COMMAND\n`;
         menuText += `┗━━━━━━━━━━━━━━━━━\n`;
-        categories.fun.forEach(cmd => {
-          menuText += `│ ➜ ${config.prefix}${cmd.name}\n`;
+        gameLines.forEach((name) => {
+          menuText += `│ ➜ ${config.prefix}${name}\n`;
         });
         menuText += `\n`;
       }
@@ -164,7 +210,7 @@ module.exports = {
       
       menuText += `╰━━━━━━━━━━━━━━━━━\n\n`;
       menuText += `💡 Type ${config.prefix}help <command> for more info\n`;
-      menuText += `🌟 Bot Version: 1.0.3\n`;
+      menuText += `🌟 Bot Version: 2.0.0\n`;
       
       // Send menu with image
       const fs = require('fs');

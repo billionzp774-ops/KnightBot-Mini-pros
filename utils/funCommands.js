@@ -335,26 +335,23 @@ const randomCommands = [
   },
 ];
 
+// Reaction GIFs from KnightAPI — type must match /api/gif/:type
 const actionCommands = [
   createActionCommand('slap', ['hit'], 'slapped', '👋'),
   createActionCommand('kiss', ['smooch'], 'kissed', '💋'),
   createActionCommand('hug', ['hugme'], 'hugged', '🤗'),
-  {
-    name: 'poke',
-    aliases: ['prod'],
-    category: 'fun',
-    description: 'Poke a user',
-    usage: '.poke @user',
-    async execute(sock, msg, args, extra) {
-      try {
-        const { jid, tag: t } = getTargetUser(msg, extra);
-        const n = Math.floor(Math.random() * 900) + 100;
-        await sendMention(sock, extra.from, msg, `👉 ${tag(extra.sender)} poked ${t} *${n}* times!`, [extra.sender, jid]);
-      } catch (e) {
-        await extra.reply('❌ Something went wrong.');
-      }
-    },
-  },
+  createActionCommand('pat', ['headpat'], 'patted', '🫶'),
+  createActionCommand('cuddle', ['snuggle'], 'cuddled', '🥰'),
+  createActionCommand('poke', ['prod'], 'poked', '👉'),
+  createActionCommand('bite', [], 'bit', '😬'),
+  createActionCommand('bonk', [], 'bonked', '🔨'),
+  createActionCommand('punch', ['hitpunch'], 'punched', '👊'),
+  createActionCommand('yeet', [], 'yeeted', '🚀'),
+  createActionCommand('highfive', ['high5', 'hf'], 'high-fived', '✋'),
+  createActionCommand('handhold', ['holdhands'], 'held hands with', '🤝'),
+  createActionCommand('tickle', [], 'tickled', '🪶'),
+  createActionCommand('feed', [], 'fed', '🍽️'),
+  createActionCommand('wave', ['hiwave'], 'waved at', '👋'),
 ];
 
 function makeStatsCmd(name, aliases, desc, builder) {
