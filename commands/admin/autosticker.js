@@ -12,7 +12,7 @@ module.exports = {
   usage: '.autosticker <on/off>',
   groupOnly: true,
   adminOnly: true,
-  botAdminNeeded: false,
+  botAdminNeeded: true,
   
   async execute(sock, msg, args, extra) {
     try {

@@ -6,6 +6,8 @@
 const { igdl } = require('ruhend-scraper');
 const axios = require('axios');
 const { exec } = require('child_process');
+const { spawn } = require('child_process');
+const ffmpegPath = require('ffmpeg-static');
 const fs = require('fs');
 const path = require('path');
 const webp = require('node-webpmux');
@@ -92,9 +94,27 @@ function pickMediaUrl(media) {
 const MAX_FILE_SIZE = 50 * 1024 * 1024;
 // Max media duration: 5 minutes
 const MAX_DURATION_SECONDS = 5 * 60;
+// Full-reel stickers stay playable on WhatsApp only up to about this length.
+const FULL_STICKER_SECONDS = 20;
 
-// Convert buffer to sticker webp
-async function convertBufferToStickerWebp(inputBuffer, isAnimated, cropSquare) {
+function probeDurationSeconds(file) {
+  return new Promise((resolve) => {
+    const ff = spawn(ffmpegPath, ['-i', file], { windowsHide: true });
+    let err = '';
+    ff.stderr.on('data', (chunk) => { err += chunk.toString(); });
+    ff.on('error', () => resolve(8));
+    ff.on('close', () => {
+      const match = /Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(err);
+      if (!match) return resolve(8);
+      const seconds = (Number(match[1]) * 3600) + (Number(match[2]) * 60) + parseFloat(match[3]);
+      if (!Number.isFinite(seconds) || seconds <= 0) return resolve(8);
+      resolve(Math.min(seconds, FULL_STICKER_SECONDS));
+    });
+  });
+}
+
+// Convert buffer to sticker webp. fullDuration keeps the reel length instead of cutting at 2s.
+async function convertBufferToStickerWebp(inputBuffer, isAnimated, cropSquare, fullDuration = false) {
   // Check file size
   if (inputBuffer.length > MAX_FILE_SIZE) {
     throw new Error(`File too large: ${(inputBuffer.length / 1024 / 1024).toFixed(2)}MB (max: ${MAX_FILE_SIZE / 1024 / 1024}MB)`);
@@ -114,15 +134,17 @@ async function convertBufferToStickerWebp(inputBuffer, isAnimated, cropSquare) {
     const vfCropSquareImg = "crop=min(iw\\,ih):min(iw\\,ih),scale=512:512";
     const vfPadSquareImg = "scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=#00000000";
 
+    const clipSeconds = (isAnimated && fullDuration) ? await probeDurationSeconds(tempInput) : 2;
     let ffmpegCommand;
     if (isAnimated) {
-      // For videos/GIFs - aggressive compression from start
-      const isLargeVideo = inputBuffer.length > (3 * 1024 * 1024); // >3MB threshold lowered
-      // Always use max 2 seconds, lower fps, lower quality
+      // igsc stays at 2s. igsf uses the reel length and only lowers quality if the file is too big.
+      const fps = fullDuration ? 8 : 6;
+      const quality = fullDuration ? 40 : 25;
+      const bitrate = fullDuration ? 140 : 60;
       if (cropSquare) {
-        ffmpegCommand = `ffmpeg -y -i "${tempInput}" -t 2 -vf "crop=min(iw\\,ih):min(iw\\,ih),scale=512:512,fps=6" -c:v libwebp -preset default -loop 0 -vsync 0 -pix_fmt yuva420p -quality 25 -compression_level 6 -b:v 60k -max_muxing_queue_size 1024 "${tempOutput}"`;
+        ffmpegCommand = `ffmpeg -y -i "${tempInput}" -t ${clipSeconds} -vf "crop=min(iw\\,ih):min(iw\\,ih),scale=512:512,fps=${fps}" -c:v libwebp -preset default -loop 0 -vsync 0 -pix_fmt yuva420p -quality ${quality} -compression_level 6 -b:v ${bitrate}k -max_muxing_queue_size 1024 "${tempOutput}"`;
       } else {
-        ffmpegCommand = `ffmpeg -y -i "${tempInput}" -t 2 -vf "scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=#00000000,fps=6" -c:v libwebp -preset default -loop 0 -vsync 0 -pix_fmt yuva420p -quality 25 -compression_level 6 -b:v 60k -max_muxing_queue_size 1024 "${tempOutput}"`;
+        ffmpegCommand = `ffmpeg -y -i "${tempInput}" -t ${clipSeconds} -vf "scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=#00000000,fps=${fps}" -c:v libwebp -preset default -loop 0 -vsync 0 -pix_fmt yuva420p -quality ${quality} -compression_level 6 -b:v ${bitrate}k -max_muxing_queue_size 1024 "${tempOutput}"`;
       }
     } else {
       // For images - lower quality
@@ -151,11 +173,11 @@ async function convertBufferToStickerWebp(inputBuffer, isAnimated, cropSquare) {
         let harsherCmd;
 
         if (isAnimated) {
-          // Progressively reduce more aggressively
-          const fps = Math.max(3, 6 - attempts);
-          const quality = Math.max(10, 25 - (attempts * 3));
-          const bitrate = Math.max(30, 60 - (attempts * 5));
-          const duration = Math.max(0.5, 2 - (attempts * 0.25));
+          // Progressively reduce more aggressively. Full reels keep their length.
+          const fps = fullDuration ? Math.max(4, 8 - attempts) : Math.max(3, 6 - attempts);
+          const quality = fullDuration ? Math.max(18, 40 - (attempts * 3)) : Math.max(10, 25 - (attempts * 3));
+          const bitrate = fullDuration ? Math.max(50, 140 - (attempts * 12)) : Math.max(30, 60 - (attempts * 5));
+          const duration = fullDuration ? clipSeconds : Math.max(0.5, 2 - (attempts * 0.25));
           const size = attempts <= 2 ? 512 : (attempts <= 4 ? 400 : (attempts <= 6 ? 320 : 256));
 
           if (cropSquare) {
@@ -214,7 +236,8 @@ async function convertBufferToStickerWebp(inputBuffer, isAnimated, cropSquare) {
           const vfSmall = cropSquare
             ? `crop=min(iw\\,ih):min(iw\\,ih),scale=${size}:${size}${isAnimated ? ',fps=3' : ''}`
             : `scale=${size}:${size}:force_original_aspect_ratio=decrease,pad=${size}:${size}:(ow-iw)/2:(oh-ih)/2:color=#00000000${isAnimated ? ',fps=3' : ''}`;
-          const cmdSmall = `ffmpeg -y -i "${tempInput}" ${isAnimated ? '-t 0.5' : ''} -vf "${vfSmall}" -c:v libwebp -preset default -loop 0 -vsync 0 -pix_fmt yuva420p -quality ${isAnimated ? 15 : 30} -compression_level 6 -b:v 30k -max_muxing_queue_size 1024 "${tempOutput3}"`;
+          const smallTrim = isAnimated ? `-t ${fullDuration ? clipSeconds : 0.5}` : '';
+          const cmdSmall = `ffmpeg -y -i "${tempInput}" ${smallTrim} -vf "${vfSmall}" -c:v libwebp -preset default -loop 0 -vsync 0 -pix_fmt yuva420p -quality ${isAnimated ? 15 : 30} -compression_level 6 -b:v 30k -max_muxing_queue_size 1024 "${tempOutput3}"`;
           await new Promise((resolve, reject) => {
             exec(cmdSmall, (error) => error ? reject(error) : resolve());
           });
@@ -375,7 +398,7 @@ async function fetchBufferFromUrl(url, itemIndex = 0) {
 }
 
 // Extreme fallback to force very small stickers when needed
-async function forceMiniSticker(inputBuffer, isVideo, cropSquare) {
+async function forceMiniSticker(inputBuffer, isVideo, cropSquare, fullDuration = false) {
   const tmpDir = getTempDir();
   const tempFiles = [];
 
@@ -393,7 +416,8 @@ async function forceMiniSticker(inputBuffer, isVideo, cropSquare) {
           ? `crop=min(iw\\,ih):min(iw\\,ih),scale=${size}:${size}${isVideo ? ',fps=3' : ''}`
           : `scale=${size}:${size}:force_original_aspect_ratio=decrease,pad=${size}:${size}:(ow-iw)/2:(oh-ih)/2:color=#00000000${isVideo ? ',fps=3' : ''}`;
 
-        const cmd = `ffmpeg -y -i "${tempInput}" ${isVideo ? '-t 0.5' : ''} -vf "${vf}" -c:v libwebp -preset default -loop 0 -pix_fmt yuva420p -quality ${isVideo ? 15 : 30} -compression_level 6 -b:v 30k "${tempOutput}"`;
+        const miniTrim = isVideo ? `-t ${fullDuration ? FULL_STICKER_SECONDS : 0.5}` : '';
+        const cmd = `ffmpeg -y -i "${tempInput}" ${miniTrim} -vf "${vf}" -c:v libwebp -preset default -loop 0 -pix_fmt yuva420p -quality ${isVideo ? 15 : 30} -compression_level 6 -b:v 30k "${tempOutput}"`;
 
         await new Promise((resolve, reject) => {
           exec(cmd, (error) => error ? reject(error) : resolve());
@@ -433,7 +457,7 @@ async function forceMiniSticker(inputBuffer, isVideo, cropSquare) {
 }
 
 // Main command handler
-async function igsCommand(sock, msg, args, extra, crop = false) {
+async function igsCommand(sock, msg, args, extra, crop = false, fullDuration = false) {
   try {
     const text = msg.message?.conversation ||
       msg.message?.extendedTextMessage?.text ||
@@ -511,13 +535,13 @@ async function igsCommand(sock, msg, args, extra, crop = false) {
         seenHashes.add(contentHash);
 
         // Convert buffer to sticker
-        let stickerBuffer = await convertBufferToStickerWebp(buffer, isVideo, crop);
+        let stickerBuffer = await convertBufferToStickerWebp(buffer, isVideo, crop, fullDuration);
 
         // Ensure final size under 1MB; keep trying until it works
         let finalSticker = stickerBuffer;
         if (finalSticker.length > 950 * 1024) {
           try {
-            const fallback = await forceMiniSticker(buffer, isVideo, crop);
+            const fallback = await forceMiniSticker(buffer, isVideo, crop, fullDuration);
             if (fallback) {
               finalSticker = fallback;
             }
@@ -540,7 +564,8 @@ async function igsCommand(sock, msg, args, extra, crop = false) {
             const vfUltra = crop
               ? `crop=min(iw\\,ih):min(iw\\,ih),scale=${ultraSize}:${ultraSize}${isVideo ? ',fps=3' : ''}`
               : `scale=${ultraSize}:${ultraSize}:force_original_aspect_ratio=decrease,pad=${ultraSize}:${ultraSize}:(ow-iw)/2:(oh-ih)/2:color=#00000000${isVideo ? ',fps=3' : ''}`;
-            const ultraCmd = `ffmpeg -y -i "${tempInput2}" ${isVideo ? '-t 0.5' : ''} -vf "${vfUltra}" -c:v libwebp -preset default -loop 0 -vsync 0 -pix_fmt yuva420p -quality ${isVideo ? 12 : 25} -compression_level 6 -b:v 25k -max_muxing_queue_size 1024 "${tempOutputUltra}"`;
+            const ultraTrim = isVideo ? `-t ${fullDuration ? FULL_STICKER_SECONDS : 0.5}` : '';
+            const ultraCmd = `ffmpeg -y -i "${tempInput2}" ${ultraTrim} -vf "${vfUltra}" -c:v libwebp -preset default -loop 0 -vsync 0 -pix_fmt yuva420p -quality ${isVideo ? 12 : 25} -compression_level 6 -b:v 25k -max_muxing_queue_size 1024 "${tempOutputUltra}"`;
 
             await new Promise((resolve, reject) => {
               exec(ultraCmd, (error) => error ? reject(error) : resolve());
@@ -597,15 +622,28 @@ async function igsCommand(sock, msg, args, extra, crop = false) {
   }
 }
 
-module.exports = {
-  name: 'igsc',
-  aliases: ['igstickercrop'],
-  description: 'Convert Instagram post/reel to cropped square sticker',
-  usage: '.igsc <Instagram URL>',
-  category: 'media',
+module.exports = [
+  {
+    name: 'igsc',
+    aliases: ['igstickercrop'],
+    description: 'Convert Instagram post/reel to a cropped square sticker (short clip)',
+    usage: ',igsc <Instagram URL>',
+    category: 'media',
 
-  async execute(sock, msg, args, extra) {
-    await igsCommand(sock, msg, args, extra, true);
+    async execute(sock, msg, args, extra) {
+      await igsCommand(sock, msg, args, extra, true, false);
+    }
+  },
+  {
+    name: 'igsf',
+    aliases: ['igstickerfull'],
+    description: 'Convert an Instagram reel to a cropped square sticker using the full reel',
+    usage: ',igsf <Instagram URL>',
+    category: 'media',
+
+    async execute(sock, msg, args, extra) {
+      await igsCommand(sock, msg, args, extra, true, true);
+    }
   }
-};
+];
 

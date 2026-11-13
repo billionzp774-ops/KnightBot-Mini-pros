@@ -1,4 +1,5 @@
 const { pick, tag, sendMention, getTwoUsers, getTargetUser } = require('./funHelpers');
+const config = require('../config');
 
 const guessGames = new Map();
 const hangmanGames = new Map();
@@ -241,16 +242,40 @@ const slotsCmd = {
   name: 'slots',
   aliases: ['slot'],
   category: 'fun',
-  description: 'Spin the slot machine',
-  usage: '.slots',
+  description: 'Spin slots — win coins on jackpot, lose coins if not',
+  get usage() {
+    return `${config.prefix}slots`;
+  },
+  groupOnly: true,
   async execute(sock, msg, args, extra) {
     try {
+      const { adjustWallet, fmtCoins } = require('./economy');
       const icons = ['🍒', '🍋', '💎', '7️⃣', '⭐'];
       const a = pick(icons);
       const b = pick(icons);
       const c = pick(icons);
-      const win = a === b && b === c;
-      await extra.reply(`${a} | ${b} | ${c}\n\n${win ? '🎉 JACKPOT! You win!' : '😅 Try again!'}`);
+      const jackpot = a === b && b === c;
+      const line = `${a} | ${b} | ${c}`;
+
+      if (jackpot) {
+        const reward = 1000;
+        const result = adjustWallet(extra.from, extra.sender, reward);
+        return extra.reply(
+          `${line}\n\n🎉 *JACKPOT!* +${fmtCoins(reward)} coins\nWallet: *${fmtCoins(result.user.wallet)}* 🪙`
+        );
+      }
+
+      const loss = 25 + Math.floor(Math.random() * 126); // 25–150
+      const result = adjustWallet(extra.from, extra.sender, -loss);
+      const taken = Math.abs(result.changed);
+      if (taken === 0) {
+        return extra.reply(
+          `${line}\n\n😅 No win — but your wallet is empty.\nWallet: *0* 🪙\nEarn coins with ,daily / ,work first.`
+        );
+      }
+      return extra.reply(
+        `${line}\n\n😅 No jackpot. -${fmtCoins(taken)} coins\nWallet: *${fmtCoins(result.user.wallet)}* 🪙`
+      );
     } catch (e) {
       console.error('[slots]', e.message);
       await extra.reply('❌ Something went wrong.');

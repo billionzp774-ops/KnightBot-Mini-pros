@@ -254,11 +254,32 @@ async function webp2gif(webpBuffer) {
 }
 
 /**
+ * Detects a fixed letterbox/pillarbox crop box (solid black/edge bars baked
+ * into the pixels) from a single representative frame. The same box is then
+ * reused for every frame so the crop window doesn't shift across the
+ * animation. WhatsApp sticker frames are always a fixed 512x512 canvas.
+ */
+function detectCropBox(framePath) {
+  return new Promise((resolve) => {
+    const cmd = `"${ffmpegPath}" -i "${framePath}" -vf "cropdetect=24:2:0" -frames:v 1 -f null -`;
+    exec(cmd, { maxBuffer: 10 * 1024 * 1024 }, (error, stdout, stderr) => {
+      const matches = [...(stderr || '').matchAll(/crop=(\d+):(\d+):(\d+):(\d+)/g)];
+      if (matches.length === 0) {
+        resolve(null);
+        return;
+      }
+      const [, w, h, x, y] = matches[matches.length - 1];
+      resolve({ w: parseInt(w, 10), h: parseInt(h, 10), x: parseInt(x, 10), y: parseInt(y, 10) });
+    });
+  });
+}
+
+/**
  * Convert WebP sticker to MP4 video (for animated stickers)
  * @param {Buffer} webpBuffer - WebP sticker buffer
  * @returns {Promise<Buffer>} MP4 video buffer
  */
-async function webp2mp4(webpBuffer) {
+async function webp2mp4(webpBuffer, { fillMode = 'pad' } = {}) {
   // Extract all frames from animated WebP using node-webpmux, then convert to MP4
   const tempDir = getTempDir();
   const timestamp = Date.now();
@@ -301,9 +322,24 @@ async function webp2mp4(webpBuffer) {
     if (actualFrameCount === 0) {
       throw new Error('No frames extracted from WebP');
     }
-    
-    // Convert frames to MP4 video
-    const mp4Cmd = `"${ffmpegPath}" -framerate 15 -i "${framesDir}/frame_%04d.png" -vf "fps=15,scale=512:512:flags=lanczos:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=#00000000" -c:v libx264 -pix_fmt yuv420p -movflags +faststart -fps_mode vfr -y "${outputPath}"`;
+
+    // cover mode: frames are already 512x512, so scale+crop alone is a no-op
+    // if bars are baked into the pixels. Detect that fixed bar once and strip
+    // it from every frame - the animated equivalent of .trim() in the static path.
+    let stripBarsFilter = '';
+    if (fillMode === 'cover') {
+      const cropBox = await detectCropBox(path.join(framesDir, frameFiles[0]));
+      if (cropBox && (cropBox.w < 512 || cropBox.h < 512)) {
+        stripBarsFilter = `crop=${cropBox.w}:${cropBox.h}:${cropBox.x}:${cropBox.y},`;
+      }
+    }
+
+    // Convert frames to MP4 video. pad keeps other callers letterboxed.
+    // cover fills the frame so H.264 does not turn transparent padding into black bars.
+    const scaleFilter = fillMode === 'cover'
+      ? `${stripBarsFilter}fps=15,scale=512:512:flags=lanczos:force_original_aspect_ratio=increase,crop=512:512`
+      : 'fps=15,scale=512:512:flags=lanczos:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=#00000000';
+    const mp4Cmd = `"${ffmpegPath}" -framerate 15 -i "${framesDir}/frame_%04d.png" -vf "${scaleFilter}" -c:v libx264 -pix_fmt yuv420p -movflags +faststart -fps_mode vfr -y "${outputPath}"`;
     
     await new Promise((resolve, reject) => {
       exec(mp4Cmd, { maxBuffer: 10 * 1024 * 1024 }, (error, stdout, stderr) => {

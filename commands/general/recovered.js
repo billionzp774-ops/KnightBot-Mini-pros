@@ -43,7 +43,17 @@ function attachListeners(sock) {
       const cached = messageCache[u.key.id];
       if (!cached) continue;
 
+      // Log it for the ,recovered command
       const who = u.key.fromMe ? "You" : cached.jid;
+      recoveredLog.push({ who, text: cached.text, time: Date.now() });
+      if (recoveredLog.length > 30) recoveredLog.shift();
+
+      // If the upstream antidelete engine is ON, it already forwards with
+      // pre-saved media — skip forwarding here to avoid duplicates.
+      let engineEnabled = false;
+      try { engineEnabled = require("../../utils/antidelete").isEnabled(); } catch (_) {}
+      if (engineEnabled) continue;
+
       let header = `♻️ Recovered deleted message\nFrom: ${who}`;
 
       try {
@@ -90,9 +100,6 @@ function attachListeners(sock) {
         });
       }
 
-      recoveredLog.push({ who, text: cached.text, time: Date.now() });
-      if (recoveredLog.length > 30) recoveredLog.shift();
-
       console.log(`[recovery] Recovered deleted message from ${who}`);
     }
   });
@@ -105,13 +112,18 @@ function attachListeners(sock) {
       const cached = messageCache[key.id];
       if (!cached) continue;
 
-      const who = cached.jid;
+      const who = key.fromMe ? "You" : cached.jid;
+      recoveredLog.push({ who, text: cached.text, time: Date.now() });
+      if (recoveredLog.length > 30) recoveredLog.shift();
+
+      // Skip forwarding if upstream antidelete engine handles it
+      let engineEnabled2 = false;
+      try { engineEnabled2 = require("../../utils/antidelete").isEnabled(); } catch (_) {}
+      if (engineEnabled2) continue;
+
       await sock.sendMessage(sock.user.id, {
         text: `♻️ Recovered deleted message\nFrom: ${who}\n"${cached.text || '[media]'}"`,
       });
-
-      recoveredLog.push({ who, text: cached.text, time: Date.now() });
-      if (recoveredLog.length > 30) recoveredLog.shift();
       console.log(`[recovery] messages.delete recovered from ${who}`);
     }
   });

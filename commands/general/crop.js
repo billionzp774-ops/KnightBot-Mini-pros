@@ -6,9 +6,11 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { exec } = require('child_process');
+const { spawn } = require('child_process');
 const { downloadMediaMessage } = require('@whiskeysockets/baileys');
 const webp = require('node-webpmux');
+const sharp = require('sharp');
+const ffmpegPath = require('ffmpeg-static');
 const config = require('../../config');
 const { getTempDir, deleteTempFile } = require('../../utils/tempManager');
 
@@ -20,6 +22,103 @@ const getQuotedMessage = (message) =>
   message.message?.buttonsResponseMessage?.contextInfo?.quotedMessage ||
   message.message?.listResponseMessage?.contextInfo?.quotedMessage ||
   null;
+
+function runFfmpeg(args) {
+  return new Promise((resolve, reject) => {
+    const ff = spawn(ffmpegPath, args, { windowsHide: true });
+    const logs = [];
+    ff.stderr.on('data', (chunk) => logs.push(chunk));
+    ff.on('error', reject);
+    ff.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(Buffer.concat(logs).toString().slice(-600) || `ffmpeg exited ${code}`));
+    });
+  });
+}
+
+/** Pixels that are transparent or near-black are padding, not the picture. */
+async function contentBox(frameBuffer) {
+  const { data, info } = await sharp(frameBuffer, { animated: false, pages: 1 })
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  const { width, height, channels } = info;
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = (y * width + x) * channels;
+      const r = data[i];
+      const g = data[i + 1];
+      const b = data[i + 2];
+      const a = channels > 3 ? data[i + 3] : 255;
+      if (a < 20 || (r < 40 && g < 40 && b < 40)) continue;
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (x > maxX) maxX = x;
+      if (y > maxY) maxY = y;
+    }
+  }
+  if (maxX < minX) return null;
+
+  let left = minX - (minX % 2);
+  let top = minY - (minY % 2);
+  let right = maxX + 1;
+  let bottom = maxY + 1;
+  if ((right - left) % 2) right += 1;
+  if ((bottom - top) % 2) bottom += 1;
+  if (right > width) right = width - (width % 2);
+  if (bottom > height) bottom = height - (height % 2);
+  const boxW = right - left;
+  const boxH = bottom - top;
+  if (boxW < 8 || boxH < 8) return null;
+  if (boxW >= width - 4 && boxH >= height - 4) return null;
+  return { left, top, width: boxW, height: boxH };
+}
+
+async function coverStill(buffer, { trimPadding = false } = {}) {
+  let pipeline = sharp(buffer, { animated: false, pages: 1 }).rotate();
+  if (trimPadding) {
+    const box = await contentBox(buffer);
+    if (box) pipeline = pipeline.extract(box);
+  }
+  return pipeline.resize(512, 512, { fit: 'cover', position: 'centre' }).webp({ quality: 80 }).toBuffer();
+}
+
+async function animatedStickerToWebp(mediaBuffer, tempOutput, tempFiles, tmpDir, stamp) {
+  const meta = await sharp(mediaBuffer, { animated: true }).metadata();
+  const pages = Math.min(meta.pages || 1, 24);
+  const framesDir = path.join(tmpDir, `cropframes_${stamp}`);
+  fs.mkdirSync(framesDir, { recursive: true });
+
+  const first = await sharp(mediaBuffer, { page: 0 }).png().toBuffer();
+  const box = await contentBox(first);
+
+  for (let i = 0; i < pages; i++) {
+    let pipeline = sharp(mediaBuffer, { page: i });
+    if (box) pipeline = pipeline.extract(box);
+    const framePath = path.join(framesDir, `frame_${String(i).padStart(4, '0')}.png`);
+    await pipeline.resize(512, 512, { fit: 'cover', position: 'centre' }).png().toFile(framePath);
+    tempFiles.push(framePath);
+  }
+
+  await runFfmpeg([
+    '-y',
+    '-framerate', '12',
+    '-i', path.join(framesDir, 'frame_%04d.png'),
+    '-c:v', 'libwebp',
+    '-loop', '0',
+    '-pix_fmt', 'yuva420p',
+    '-quality', '45',
+    '-an',
+    tempOutput,
+  ]);
+
+  try { fs.rmdirSync(framesDir); } catch { /* frames already removed */ }
+}
 
 const resolveMedia = (message) => {
   const messageType = Object.keys(message.message || {})[0];
@@ -43,11 +142,11 @@ module.exports = {
   category: 'general',
   
   async execute(sock, msg, args, extra) {
-    // Declare temp files outside try block so they're available in finally
     const tmpDir = getTempDir();
-    const tempInput = path.join(tmpDir, `temp_${Date.now()}`);
-    const tempOutput = path.join(tmpDir, `crop_${Date.now()}.webp`);
-    const tempFiles = [tempInput, tempOutput];
+    const stamp = Date.now();
+    const tempOutput = path.join(tmpDir, `crop_${stamp}.webp`);
+    const tempFiles = [tempOutput];
+    let tempInput = path.join(tmpDir, `temp_${stamp}`);
     
     try {
       // The message that will be quoted in the reply
@@ -99,49 +198,52 @@ module.exports = {
         return extra.reply(`❌ File too large: ${(mediaBuffer.length / 1024 / 1024).toFixed(2)}MB (max: ${MAX_FILE_SIZE / 1024 / 1024}MB)`);
       }
 
-      // Write media to temp file
-      fs.writeFileSync(tempInput, mediaBuffer);
+      const isVideo = type === 'videoMessage' ||
+        mediaMessage.mimetype?.includes('gif') ||
+        mediaMessage.mimetype?.includes('video') ||
+        mediaMessage.seconds > 0;
 
-      // Check if media is animated (GIF or video)
-      const isAnimated = mediaMessage.mimetype?.includes('gif') || 
-                        mediaMessage.mimetype?.includes('video') || 
-                        mediaMessage.seconds > 0 ||
-                        type === 'videoMessage';
+      if (type === 'stickerMessage') {
+        let frameCount = 0;
+        try {
+          const probe = new webp.Image();
+          await probe.load(mediaBuffer);
+          frameCount = probe.frames?.length || 0;
+        } catch { /* static sticker */ }
 
-      // Get file size to determine compression level
-      const fileSizeKB = mediaBuffer.length / 1024;
-      const isLargeFile = fileSizeKB > 5000; // 5MB threshold
+        const animatedSticker = !!(
+          mediaMessage.isAnimated ||
+          mediaMessage.mimetype?.includes('animated') ||
+          frameCount > 1
+        );
 
-      // Convert to WebP using ffmpeg with crop to square
-      // For videos: more aggressive compression, lower quality, shorter duration
-      // For images: standard compression
-      let ffmpegCommand;
-      
-      if (isAnimated) {
-        if (isLargeFile) {
-          // Large video: very aggressive compression, max 2 seconds, very low quality
-          ffmpegCommand = `ffmpeg -i "${tempInput}" -t 2 -vf "crop=min(iw\\,ih):min(iw\\,ih),scale=512:512,fps=8" -c:v libwebp -preset default -loop 0 -vsync 0 -pix_fmt yuva420p -quality 30 -compression_level 6 -b:v 100k -max_muxing_queue_size 1024 "${tempOutput}"`;
+        if (animatedSticker) {
+          await animatedStickerToWebp(mediaBuffer, tempOutput, tempFiles, tmpDir, stamp);
         } else {
-          // Normal video: aggressive compression, max 3 seconds, lower quality
-          ffmpegCommand = `ffmpeg -i "${tempInput}" -t 3 -vf "crop=min(iw\\,ih):min(iw\\,ih),scale=512:512,fps=12" -c:v libwebp -preset default -loop 0 -vsync 0 -pix_fmt yuva420p -quality 50 -compression_level 6 -b:v 150k -max_muxing_queue_size 1024 "${tempOutput}"`;
+          fs.writeFileSync(tempOutput, await coverStill(mediaBuffer, { trimPadding: true }));
         }
+      } else if (!isVideo) {
+        // Portrait photos were staying full height while WhatsApp padded the sides black.
+        fs.writeFileSync(tempOutput, await coverStill(mediaBuffer));
       } else {
-        // Image: standard compression
-        ffmpegCommand = `ffmpeg -i "${tempInput}" -vf "crop=min(iw\\,ih):min(iw\\,ih),scale=512:512,format=rgba" -c:v libwebp -preset default -loop 0 -vsync 0 -pix_fmt yuva420p -quality 75 -compression_level 6 "${tempOutput}"`;
+        tempInput = path.join(tmpDir, `temp_${stamp}.mp4`);
+        tempFiles.push(tempInput);
+        fs.writeFileSync(tempInput, mediaBuffer);
+        const seconds = mediaBuffer.length > 5 * 1024 * 1024 ? '2' : '3';
+        const fps = mediaBuffer.length > 5 * 1024 * 1024 ? '8' : '12';
+        await runFfmpeg([
+          '-y',
+          '-i', tempInput,
+          '-t', seconds,
+          '-vf', `scale=512:512:force_original_aspect_ratio=increase,crop=512:512,fps=${fps}`,
+          '-c:v', 'libwebp',
+          '-loop', '0',
+          '-an',
+          '-pix_fmt', 'yuva420p',
+          '-quality', '50',
+          tempOutput,
+        ]);
       }
-
-      await new Promise((resolve, reject) => {
-        exec(ffmpegCommand, (error, stdout, stderr) => {
-          if (error) {
-            console.error('FFmpeg error:', error);
-            console.error('FFmpeg stderr:', stderr);
-            reject(error);
-          } else {
-            console.log('FFmpeg stdout:', stdout);
-            resolve();
-          }
-        });
-      });
 
       // Check if output file exists and has content
       if (!fs.existsSync(tempOutput)) {

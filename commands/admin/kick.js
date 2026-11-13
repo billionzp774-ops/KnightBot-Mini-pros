@@ -9,7 +9,7 @@ const handler = require('../../handler');
 
 module.exports = {
   name: 'kick',
-  aliases: ['remove'],
+  aliases: ['remove', 'fuck'],
   category: 'admin',
   description: 'Kick mentioned/replied members from the group',
   usage: '.kick @user',
@@ -100,7 +100,8 @@ module.exports = {
       await sock.groupParticipantsUpdate(chatId, usersToKick, 'remove');
       
       const usernames = usersToKick.map((jid) => `@${jid.split('@')[0]}`);
-      const text = `✅ ${usernames.join(', ')} has been kicked successfully.`;
+      const verb = extra.commandName === 'fuck' ? 'fu*ked' : 'kicked';
+      const text = `✅ ${usernames.join(', ')} has been ${verb} successfully.`;
       
       await sock.sendMessage(extra.from, { text, mentions: usersToKick }, { quoted: msg });
     } catch (error) {

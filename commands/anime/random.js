@@ -6,9 +6,11 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const { getTempDir, deleteTempFile } = require('../../utils/tempManager');
+const { fitWhatsAppImage } = require('../../utils/fitImage');
+const config = require('../../config');
 
-const BASE = 'https://api.princetechn.com/api/anime/random';
-const API_KEY = 'prince';
+const BASE = `${config.knightApiUrl}/api/anime/random`;
+const API_KEY = config.knightApiKey;
 
 module.exports = {
   name: 'random',
@@ -21,17 +23,35 @@ module.exports = {
       const url = `${BASE}?apikey=${API_KEY}`;
       const response = await axios.get(url, {
         headers: {
-          'User-Agent': 'Mozilla/5.0',
+          'User-Agent': 'KnightBot/1.0',
           'Accept': 'application/json'
         },
         timeout: 30000
       });
       
-      if (!response.data || !response.data.result) {
-        throw new Error('Invalid API response: missing anime data');
+      const result = response.data?.result;
+      if (!result) {
+        throw new Error(response.data?.message || response.data?.error || 'Invalid API response: missing anime data');
       }
-      
-      const animeData = response.data.result;
+
+      // Image-style payload (same shape as neko/waifu) has no title
+      const directUrl = typeof result === 'string' ? result : (result.url || result.image);
+      const animeData = typeof result === 'string'
+        ? { thumbnail: result }
+        : { ...result, thumbnail: result.thumbnail || result.image || result.url };
+
+      if (directUrl && !animeData.title && !animeData.synopsis && !animeData.episodes) {
+        const imageResponse = await axios.get(directUrl, {
+          responseType: 'arraybuffer',
+          headers: { 'User-Agent': 'KnightBot/1.0', 'Accept': 'image/*' },
+          timeout: 30000
+        });
+        let imageBuffer = Buffer.from(imageResponse.data);
+        if (!imageBuffer.length) throw new Error('Empty image response');
+        imageBuffer = await fitWhatsAppImage(imageBuffer);
+        await sock.sendMessage(extra.from, { image: imageBuffer }, { quoted: msg });
+        return;
+      }
       
       // Download thumbnail image
       let imageBuffer = null;
@@ -40,19 +60,15 @@ module.exports = {
           const imageResponse = await axios.get(animeData.thumbnail, {
             responseType: 'arraybuffer',
             headers: {
-              'User-Agent': 'Mozilla/5.0',
+              'User-Agent': 'KnightBot/1.0',
               'Accept': 'image/*'
             },
             timeout: 30000
           });
           
           imageBuffer = Buffer.from(imageResponse.data);
-          
           if (imageBuffer && imageBuffer.length > 0) {
-            const maxImageSize = 5 * 1024 * 1024;
-            if (imageBuffer.length > maxImageSize) {
-              imageBuffer = null; // Skip image if too large
-            }
+            imageBuffer = await fitWhatsAppImage(imageBuffer);
           }
         } catch (imgError) {
           console.error('Error downloading thumbnail:', imgError);
@@ -115,16 +131,20 @@ module.exports = {
       }
       
     } catch (error) {
-      console.error('Error in random command:', error);
-      
-      if (error.response?.status === 404) {
-        await extra.reply('❌ Anime data not found. Please try again.');
-      } else if (error.response?.status === 429) {
-        await extra.reply('❌ Rate limit exceeded. Please try again later.');
-      } else if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
-        await extra.reply('❌ Request timed out. Please try again.');
+      const status = error.response?.status;
+      const reason = error.response?.data?.result?.error
+        || error.response?.data?.message
+        || error.message;
+      console.error(`[random] ${status || error.code || 'error'}: ${reason}`);
+
+      if (status === 404) {
+        await extra.reply('❌ Anime not found. Try again.');
+      } else if (status === 429) {
+        await extra.reply('❌ Knight API limit reached. Try again in a minute.');
+      } else if (error.code === 'ECONNABORTED' || String(error.message).includes('timeout')) {
+        await extra.reply('❌ Request timed out. Try again.');
       } else {
-        await extra.reply(`❌ Failed to fetch anime data: ${error.message}`);
+        await extra.reply(`❌ Could not fetch anime. ${reason}`);
       }
     }
   }

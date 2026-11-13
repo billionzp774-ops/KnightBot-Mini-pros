@@ -138,10 +138,85 @@ const findParticipant = (participants = [], userIds) => {
   }) || null;
 };
 
+function digitsOf(value) {
+  const num = String(value || '').split('@')[0].split(':')[0].replace(/\D/g, '');
+  if (num.length < 8 || num.length > 15) return null;
+  return num;
+}
+
+function phoneJidFromLid(user, server) {
+  const pn = digitsOf(getLidMappingValue(user, 'lidToPn'));
+  if (!pn) return null;
+  const pnServer = server === 'hosted.lid' ? 'hosted' : 's.whatsapp.net';
+  return jidEncode(pn, pnServer);
+}
+
+/**
+ * Turn a LID (or a phone JID) into a mention you can drop into sendMessage.
+ * Pass one JID or a list. A real phone wins over a LID. participantAlt first.
+ *
+ * const { lidToMention } = require('./utils/jidHelper');
+ * const who = lidToMention([msg.key.participantAlt, msg.key.participant]);
+ * await sock.sendMessage(jid, { text: `from ${who.text}`, mentions: who.mentions });
+ *
+ * who.number is the phone digits, or null when WhatsApp has not mapped that LID yet.
+ * In that case who.jid is the @lid and who.text is still an @mention, not "+<lid>".
+ */
+function lidToMention(candidates) {
+  const list = (Array.isArray(candidates) ? candidates : [candidates]).filter(Boolean);
+  let lidFallback = null;
+
+  for (const jid of list) {
+    const raw = String(jid);
+    let decoded = null;
+    try {
+      decoded = jidDecode(raw);
+    } catch {
+      decoded = null;
+    }
+
+    const bareUser = String(decoded?.user || raw.split('@')[0]).split(':')[0];
+    const server = decoded?.server === 'c.us' ? 's.whatsapp.net' : decoded?.server;
+    const isLid = server === 'lid' || server === 'hosted.lid' || raw.includes('@lid') || raw.includes('hosted.lid');
+
+    if (isLid) {
+      const phoneJid = phoneJidFromLid(bareUser.replace(/\D/g, '') || bareUser, server || 'lid');
+      if (phoneJid) {
+        const number = phoneJid.split('@')[0];
+        return { jid: phoneJid, number, isLid: false, text: `@${number}`, mentions: [phoneJid] };
+      }
+      if (!lidFallback) lidFallback = raw.includes('@') ? raw.split(':')[0] : `${bareUser}@lid`;
+      continue;
+    }
+
+    if (server === 's.whatsapp.net' || server === 'hosted' || raw.endsWith('@s.whatsapp.net') || raw.endsWith('@c.us')) {
+      const number = digitsOf(bareUser);
+      if (!number) continue;
+      const phoneJid = jidEncode(number, server === 'hosted' ? 'hosted' : 's.whatsapp.net');
+      return { jid: phoneJid, number, isLid: false, text: `@${number}`, mentions: [phoneJid] };
+    }
+  }
+
+  if (lidFallback) {
+    return { jid: lidFallback, number: null, isLid: true, text: `@${lidFallback.split('@')[0]}`, mentions: [lidFallback] };
+  }
+  return { jid: null, number: null, isLid: false, text: '', mentions: [] };
+}
+
+/** Phone digits for a LID or phone JID. Null when the LID is not mapped yet. */
+function lidToNumber(jid) {
+  const mention = lidToMention(jid);
+  return mention.isLid ? null : mention.number;
+}
+
 module.exports = {
   findParticipant,
   buildComparableIds,
   normalizeJidWithLid,
-  getLidMappingValue
+  getLidMappingValue,
+  lidToMention,
+  lidToNumber,
 };
+module.exports.lidToMention = lidToMention;
+module.exports.lidToNumber = lidToNumber;
 
