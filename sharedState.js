@@ -44,9 +44,12 @@ class BotState extends EventEmitter {
         resolvePhone(jid) {
                 if (!jid) return null;
 
-                // Already a phone number JID
-                const raw = jid.split('@')[0];
-                if (/^\d{7,15}$/.test(raw)) return raw;
+                const [raw0, serverRaw] = String(jid).split('@');
+                const raw = raw0.split(':')[0];
+                const isLidServer = /lid/i.test(serverRaw || '');
+
+                // Already a phone number JID — never treat @lid digits as a phone
+                if (!isLidServer && /^\d{7,15}$/.test(raw)) return raw;
 
                 // Check LID map
                 const pnJid = this.lidMap.get(jid);
@@ -56,7 +59,7 @@ class BotState extends EventEmitter {
                 }
 
                 // Also check with just the user part (in case jid has device suffix)
-                const userOnly = raw.split(':')[0];
+                const userOnly = raw;
                 for (const [lid, pn] of this.lidMap.entries()) {
                         if (lid.split('@')[0] === userOnly) {
                                 const p = pn.split('@')[0];
@@ -74,16 +77,19 @@ class BotState extends EventEmitter {
         resolvePnJid(jid) {
                 if (!jid) return jid;
 
-                // Already a phone number
-                const raw = jid.split('@')[0];
-                if (/^\d{7,15}$/.test(raw)) return jid;
+                const [raw0, serverRaw] = String(jid).split('@');
+                const raw = raw0.split(':')[0];
+                const isLidServer = /lid/i.test(serverRaw || '');
+
+                // Already a phone number JID — never treat @lid digits as a phone
+                if (!isLidServer && /^\d{7,15}$/.test(raw)) return jid;
 
                 // Check LID map
                 const pnJid = this.lidMap.get(jid);
                 if (pnJid) return pnJid;
 
                 // Try without device suffix
-                const userOnly = raw.split(':')[0];
+                const userOnly = raw;
                 for (const [lid, pn] of this.lidMap.entries()) {
                         if (lid.split('@')[0] === userOnly) return pn;
                 }

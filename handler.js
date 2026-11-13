@@ -234,6 +234,11 @@ const isMod = (sender) => {
 // LID mapping cache
 const lidMappingCache = new Map();
 
+/** Drop cached nulls so freshly written mapping files are picked up immediately. */
+function clearLidMappingCache() {
+  lidMappingCache.clear();
+}
+
 // Helper to normalize JID to just the number part
 const normalizeJid = (jid) => {
   if (!jid) return null;
@@ -1957,5 +1962,6 @@ module.exports = {
   isBotLikeMessageId,
   getGroupMetadata,
   peekGroupMetadata,
-  findParticipant
+  findParticipant,
+  clearLidMappingCache
 };

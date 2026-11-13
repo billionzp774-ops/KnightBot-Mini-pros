@@ -74,6 +74,8 @@ const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
 const os = require('os');
+const lidMappingStore = require('./utils/lidMappingStore');
+lidMappingStore.hydrate(); // restore saved LID->phone pairs for the dashboard
 
 // Remove Puppeteer cache (if some dependency downloaded Chromium into ~/.cache/puppeteer)
 function cleanupPuppeteerCache() {
@@ -399,6 +401,9 @@ async function startBot() {
 
       // Initialize anti-call feature
       handler.initializeAntiCall(sock);
+
+      // Learn LID <-> real phone pairs from WhatsApp (dashboard + welcome mentions)
+      lidMappingStore.attach(sock);
 
       // Auto-init all commands that have init() (plugins like save, recovered)
       const { getInitCommands } = require('./utils/commandLoader');

@@ -209,11 +209,17 @@ function lidToNumber(jid) {
   return mention.isLid ? null : mention.number;
 }
 
+/** Drop cached nulls so freshly written mapping files are picked up immediately. */
+function clearLidMappingCache() {
+  lidMappingCache.clear();
+}
+
 module.exports = {
   findParticipant,
   buildComparableIds,
   normalizeJidWithLid,
   getLidMappingValue,
+  clearLidMappingCache,
   lidToMention,
   lidToNumber,
 };
